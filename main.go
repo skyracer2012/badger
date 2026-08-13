@@ -424,20 +424,27 @@ func (p *Badger) renderRedirectPage(redirectURL string) string {
 }
 
 func (p *Badger) getRealIP(req *http.Request) string {
-	// Check if request comes from a trusted source
-	isTrusted := p.isTrustedIP(req.RemoteAddr)
+	// Forwarded IP headers are already sanitized before this middleware runs:
+	// the Traefik entrypoint's forwardedHeaders.trustedIPs config strips all
+	// X-Forwarded-* headers when the immediate peer is not trusted, so any
+	// non-empty value below must originate from a trusted proxy (e.g. Caddy).
+	// This does not require trustip to be delivered to the plugin, which
+	// matters because Pangolin generates the middleware config for public
+	// resources without trustip/customIPHeader.
+	headerName := p.customIPHeader
+	if headerName == "" {
+		headerName = xForwardFor
+	}
 
-	// If custom IP header is configured, use it
-	if p.customIPHeader != "" {
-		if customIP := req.Header.Get(p.customIPHeader); customIP != "" && isTrusted {
-			return customIP
+	if v := req.Header.Get(headerName); v != "" {
+		if ip := firstValidIP(v); ip != "" {
+			return ip
 		}
 	}
 
-	// Default: use CF-Connecting-IP if from trusted source
-	if isTrusted {
-		if cfIP := req.Header.Get(cfConnectingIP); cfIP != "" {
-			return cfIP
+	if cfIP := req.Header.Get(cfConnectingIP); cfIP != "" {
+		if ip := firstValidIP(cfIP); ip != "" {
+			return ip
 		}
 	}
 
@@ -448,6 +455,19 @@ func (p *Badger) getRealIP(req *http.Request) string {
 		return req.RemoteAddr
 	}
 	return ip
+}
+
+// firstValidIP returns the first valid IP address in a header value that may
+// contain multiple comma-separated addresses (e.g. X-Forwarded-For), or ""
+// if none is found. It normalizes the result (net.IP.String has no brackets
+// and no port, which Pangolin parses directly).
+func firstValidIP(value string) string {
+	for _, part := range strings.Split(value, ",") {
+		if ip := net.ParseIP(strings.TrimSpace(part)); ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
 }
 
 func (p *Badger) stripSessionParam(req *http.Request) {
