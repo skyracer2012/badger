@@ -1,3 +1,3 @@
-module github.com/onno204/badger
+module github.com/skyracer2012/badger
 
 go 1.25

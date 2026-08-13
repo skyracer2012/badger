@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/onno204/badger/ips"
-	"github.com/onno204/badger/version"
+	"github.com/skyracer2012/badger/ips"
+	"github.com/skyracer2012/badger/version"
 )
 
 type Config struct {
