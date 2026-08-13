@@ -8,14 +8,31 @@ import (
 	"net"
 	"net/http"
 	"strings"
+
+	"github.com/onno204/badger/ips"
+	"github.com/onno204/badger/version"
 )
 
 type Config struct {
-	APIBaseUrl                  string  `json:"apiBaseUrl"`
-	UserSessionCookieName       string  `json:"userSessionCookieName"`
-	ResourceSessionRequestParam string  `json:"resourceSessionRequestParam"`
-	ClientIPHeader              *string `json:"clientIpHeader,omitempty"`
+	APIBaseUrl                  string   `json:"apiBaseUrl,omitempty"`
+	UserSessionCookieName       string   `json:"userSessionCookieName,omitempty"`
+	ResourceSessionRequestParam string   `json:"resourceSessionRequestParam,omitempty"`
+	AccessTokenQueryParam       string   `json:"accessTokenQueryParam,omitempty"`
+	AccessTokenIDHeader         string   `json:"accessTokenIdHeader,omitempty"`
+	AccessTokenHeader           string   `json:"accessTokenHeader,omitempty"`
+	DisableForwardAuth          bool     `json:"disableForwardAuth,omitempty"`
+	TrustIP                     []string `json:"trustip,omitempty"`
+	DisableDefaultCFIPs         bool     `json:"disableDefaultCFIPs,omitempty"`
+	CustomIPHeader              string   `json:"customIPHeader,omitempty"`
 }
+
+const (
+	xRealIP        = "X-Real-Ip"
+	xForwardFor    = "X-Forwarded-For"
+	xForwardProto  = "X-Forwarded-Proto"
+	cfConnectingIP = "CF-Connecting-IP"
+	cfVisitor      = "CF-Visitor"
+)
 
 type Badger struct {
 	next                        http.Handler
@@ -23,7 +40,12 @@ type Badger struct {
 	apiBaseUrl                  string
 	userSessionCookieName       string
 	resourceSessionRequestParam string
-	clientIPHeader              *string
+	accessTokenQueryParam       string
+	accessTokenIDHeader         string
+	accessTokenHeader           string
+	disableForwardAuth          bool
+	trustIP                     []*net.IPNet
+	customIPHeader              string
 }
 
 type VerifyBody struct {
@@ -37,16 +59,22 @@ type VerifyBody struct {
 	RequestIP          *string           `json:"requestIp,omitempty"`
 	Headers            map[string]string `json:"headers,omitempty"`
 	Query              map[string]string `json:"query,omitempty"`
+	BadgerVersion      string            `json:"badgerVersion,omitempty"`
 }
 
 type VerifyResponse struct {
 	Data struct {
-		Valid           bool              `json:"valid"`
-		RedirectURL     *string           `json:"redirectUrl"`
-		Username        *string           `json:"username,omitempty"`
-		Email           *string           `json:"email,omitempty"`
-		Name            *string           `json:"name,omitempty"`
-		ResponseHeaders map[string]string `json:"responseHeaders,omitempty"`
+		HeaderAuthChallenged bool              `json:"headerAuthChallenged"`
+		Valid                bool              `json:"valid"`
+		RedirectURL          *string           `json:"redirectUrl"`
+		UserId               *string           `json:"userId,omitempty"`
+		DontStripSession     bool              `json:"dontStripSession,omitempty"`
+		Username             *string           `json:"username,omitempty"`
+		Email                *string           `json:"email,omitempty"`
+		Name                 *string           `json:"name,omitempty"`
+		Role                 *string           `json:"role,omitempty"`
+		ResponseHeaders      map[string]string `json:"responseHeaders,omitempty"`
+		PangolinVersion      *string           `json:"pangolinVersion,omitempty"`
 	} `json:"data"`
 }
 
@@ -69,26 +97,74 @@ func CreateConfig() *Config {
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	return &Badger{
+	badger := &Badger{
 		next:                        next,
 		name:                        name,
 		apiBaseUrl:                  config.APIBaseUrl,
 		userSessionCookieName:       config.UserSessionCookieName,
 		resourceSessionRequestParam: config.ResourceSessionRequestParam,
-		clientIPHeader:              config.ClientIPHeader,
-	}, nil
+		accessTokenQueryParam:       config.AccessTokenQueryParam,
+		accessTokenIDHeader:         config.AccessTokenIDHeader,
+		accessTokenHeader:           config.AccessTokenHeader,
+		disableForwardAuth:          config.DisableForwardAuth,
+		customIPHeader:              config.CustomIPHeader,
+	}
+
+	// Validate required fields only if forward auth is enabled
+	if !config.DisableForwardAuth {
+		if config.APIBaseUrl == "" {
+			return nil, fmt.Errorf("apiBaseUrl is required when forward auth is enabled")
+		}
+		if config.UserSessionCookieName == "" {
+			return nil, fmt.Errorf("userSessionCookieName is required when forward auth is enabled")
+		}
+		if config.ResourceSessionRequestParam == "" {
+			return nil, fmt.Errorf("resourceSessionRequestParam is required when forward auth is enabled")
+		}
+	}
+
+	if config.TrustIP != nil {
+		for _, v := range config.TrustIP {
+			_, trustip, err := net.ParseCIDR(v)
+			if err != nil {
+				return nil, err
+			}
+			badger.trustIP = append(badger.trustIP, trustip)
+		}
+	}
+
+	if !config.DisableDefaultCFIPs {
+		for _, v := range ips.CFIPs() {
+			_, trustip, err := net.ParseCIDR(v)
+			if err != nil {
+				return nil, err
+			}
+			badger.trustIP = append(badger.trustIP, trustip)
+		}
+	}
+
+	return badger, nil
 }
 
 func (p *Badger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	realIP := p.getRealIP(req)
+	p.setIPHeaders(req, realIP)
+
+	if p.disableForwardAuth {
+		p.next.ServeHTTP(rw, req)
+		return
+	}
+
 	cookies := p.extractCookies(req)
-	clientIP := p.getClientIP(req)
+
 	queryValues := req.URL.Query()
+	hadAccessTokenQuery := p.accessTokenQueryParam != "" && queryValues.Get(p.accessTokenQueryParam) != ""
 
 	if sessionRequestValue := queryValues.Get(p.resourceSessionRequestParam); sessionRequestValue != "" {
 		body := ExchangeSessionBody{
 			RequestToken: &sessionRequestValue,
 			RequestHost:  &req.Host,
-			RequestIP:    clientIP,
+			RequestIP:    &realIP,
 		}
 
 		jsonData, err := json.Marshal(body)
@@ -164,9 +240,10 @@ func (p *Badger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		RequestPath:        &req.URL.Path,
 		RequestMethod:      &req.Method,
 		TLS:                req.TLS != nil,
-		RequestIP:          clientIP,
+		RequestIP:          &realIP,
 		Headers:            headers,
 		Query:              queryParams,
+		BadgerVersion:      version.Version,
 	}
 
 	jsonData, err := json.Marshal(cookieData)
@@ -185,6 +262,7 @@ func (p *Badger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	for _, setCookie := range resp.Header["Set-Cookie"] {
 		rw.Header().Add("Set-Cookie", setCookie)
 	}
+	receivedSetCookie := len(resp.Header["Set-Cookie"]) > 0
 
 	if resp.StatusCode != http.StatusOK {
 		http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
@@ -198,10 +276,30 @@ func (p *Badger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	req.Header.Del("Remote-User")
+	req.Header.Del("Remote-Email")
+	req.Header.Del("Remote-Name")
+	req.Header.Del("Remote-Role")
+	req.Header.Del("Remote-User-Id")
+
 	if result.Data.ResponseHeaders != nil {
 		for key, value := range result.Data.ResponseHeaders {
 			rw.Header().Add(key, value)
 		}
+	}
+
+	if result.Data.HeaderAuthChallenged {
+		fmt.Println("Badger: challenging client for header authentication")
+		rw.Header().Add("WWW-Authenticate", "Basic realm=\"pangolin\"")
+
+		if result.Data.RedirectURL != nil && *result.Data.RedirectURL != "" {
+			rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+			rw.WriteHeader(http.StatusUnauthorized)
+			rw.Write([]byte(p.renderRedirectPage(*result.Data.RedirectURL)))
+		} else {
+			http.Error(rw, "Unauthorized", http.StatusUnauthorized)
+		}
+		return
 	}
 
 	if result.Data.RedirectURL != nil && *result.Data.RedirectURL != "" {
@@ -211,6 +309,22 @@ func (p *Badger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	if result.Data.Valid {
+		if hadAccessTokenQuery && receivedSetCookie && req.Method == http.MethodGet {
+			cleanQuery := req.URL.Query()
+			cleanQuery.Del(p.accessTokenQueryParam)
+			cleaned := cleanQuery.Encode()
+			cleanURL := fmt.Sprintf("%s://%s%s", p.getScheme(req), req.Host, req.URL.Path)
+			if cleaned != "" {
+				cleanURL = fmt.Sprintf("%s?%s", cleanURL, cleaned)
+			}
+			fmt.Println("Badger: Access token session created, redirecting to", cleanURL)
+			http.Redirect(rw, req, cleanURL, http.StatusFound)
+			return
+		}
+
+		if result.Data.UserId != nil {
+			req.Header.Add("Remote-User-Id", *result.Data.UserId)
+		}
 
 		if result.Data.Username != nil {
 			req.Header.Add("Remote-User", *result.Data.Username)
@@ -222,6 +336,16 @@ func (p *Badger) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 		if result.Data.Name != nil {
 			req.Header.Add("Remote-Name", *result.Data.Name)
+		}
+
+		if result.Data.Role != nil {
+			req.Header.Add("Remote-Role", *result.Data.Role)
+		}
+
+		if !result.Data.DontStripSession {
+			p.stripSessionParam(req)
+			p.stripSessionCookies(req)
+			p.stripAccessTokenHeaders(req)
 		}
 
 		fmt.Println("Badger: Valid session")
@@ -255,56 +379,174 @@ func (p *Badger) getScheme(req *http.Request) string {
 	return "http"
 }
 
-func (p *Badger) getClientIP(req *http.Request) *string {
-	// If no specific header is configured, use remote address (safe default)
-	if p.clientIPHeader == nil || *p.clientIPHeader == "" {
-		remoteIP, _, err := net.SplitHostPort(req.RemoteAddr)
-		if err != nil {
-			// If SplitHostPort fails, assume req.RemoteAddr is just an IP
-			remoteIP = req.RemoteAddr
+func (p *Badger) renderRedirectPage(redirectURL string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Redirecting...</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f5f5f5;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        a {
+            color: #0066cc;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <p>Redirecting...</p>
+        <p>If you are not redirected automatically, <a href="%s">click here</a>.</p>
+    </div>
+    <script>
+        window.location.href = "%s";
+    </script>
+</body>
+</html>`, redirectURL, redirectURL)
+}
+
+func (p *Badger) getRealIP(req *http.Request) string {
+	// Check if request comes from a trusted source
+	isTrusted := p.isTrustedIP(req.RemoteAddr)
+
+	// If custom IP header is configured, use it
+	if p.customIPHeader != "" {
+		if customIP := req.Header.Get(p.customIPHeader); customIP != "" && isTrusted {
+			return customIP
 		}
-		return &remoteIP
 	}
-	
-	// Get the specified header value
-	headerValue := req.Header.Get(*p.clientIPHeader)
-	if headerValue == "" {
-		// Header not found, fallback to remote address
-		remoteIP, _, err := net.SplitHostPort(req.RemoteAddr)
-		if err != nil {
-			remoteIP = req.RemoteAddr
+
+	// Default: use CF-Connecting-IP if from trusted source
+	if isTrusted {
+		if cfIP := req.Header.Get(cfConnectingIP); cfIP != "" {
+			return cfIP
 		}
-		return &remoteIP
 	}
-	
-	// Special handling for X-Forwarded-For header (contains comma-separated IPs)
-	if strings.ToLower(*p.clientIPHeader) == "x-forwarded-for" {
-		// X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2"
-		// The first one should be the original client IP
-		ips := strings.Split(headerValue, ",")
-		for _, ip := range ips {
-			ip = strings.TrimSpace(ip)
-			if parsedIP := net.ParseIP(ip); parsedIP != nil {
-				return &ip
+
+	// Fallback: extract IP from RemoteAddr
+	ip, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		// If parsing fails, return RemoteAddr as-is (might be just IP without port)
+		return req.RemoteAddr
+	}
+	return ip
+}
+
+func (p *Badger) stripSessionParam(req *http.Request) {
+	query := req.URL.Query()
+	modified := false
+	if query.Has(p.resourceSessionRequestParam) {
+		query.Del(p.resourceSessionRequestParam)
+		modified = true
+	}
+	if p.accessTokenQueryParam != "" && query.Has(p.accessTokenQueryParam) {
+		query.Del(p.accessTokenQueryParam)
+		modified = true
+	}
+	if modified {
+		req.URL.RawQuery = query.Encode()
+		req.RequestURI = req.URL.RequestURI()
+	}
+}
+
+func (p *Badger) stripAccessTokenHeaders(req *http.Request) {
+	if p.accessTokenIDHeader != "" {
+		req.Header.Del(p.accessTokenIDHeader)
+	}
+	if p.accessTokenHeader != "" {
+		req.Header.Del(p.accessTokenHeader)
+	}
+}
+
+// stripSessionCookies removes session cookies from the request before forwarding to the backend.
+// It processes raw Cookie header pairs so non-target cookies are preserved as-is.
+func (p *Badger) stripSessionCookies(req *http.Request) {
+	cookieHeaders := req.Header.Values("Cookie")
+	if len(cookieHeaders) == 0 {
+		return
+	}
+
+	var remainingPairs []string
+	for _, headerValue := range cookieHeaders {
+		for _, part := range strings.Split(headerValue, ";") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			name, _, _ := strings.Cut(part, "=")
+			name = strings.TrimSpace(name)
+			if !strings.HasPrefix(name, p.userSessionCookieName) {
+				remainingPairs = append(remainingPairs, part)
 			}
 		}
-		// If no valid IP found in X-Forwarded-For, fallback to remote address
-		remoteIP, _, err := net.SplitHostPort(req.RemoteAddr)
-		if err != nil {
-			remoteIP = req.RemoteAddr
-		}
-		return &remoteIP
 	}
-	
-	// For any other header, validate it's a valid IP and return it
-	if parsedIP := net.ParseIP(headerValue); parsedIP != nil {
-		return &headerValue
+
+	if len(remainingPairs) == 0 {
+		req.Header.Del("Cookie")
+		return
 	}
-	
-	// Invalid IP in header, fallback to remote address
-	remoteIP, _, err := net.SplitHostPort(req.RemoteAddr)
+
+	// Keep a single canonical Cookie header while preserving surviving name=value pairs.
+	req.Header.Set("Cookie", strings.Join(remainingPairs, "; "))
+}
+
+func (p *Badger) isTrustedIP(remoteAddr string) bool {
+	ipStr, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		remoteIP = req.RemoteAddr
+		return false
 	}
-	return &remoteIP
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, network := range p.trustIP {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Badger) setIPHeaders(req *http.Request, realIP string) {
+	isTrusted := p.isTrustedIP(req.RemoteAddr)
+
+	if isTrusted {
+		// Handle CF-Visitor header for scheme
+		if req.Header.Get(cfVisitor) != "" {
+			var cfVisitorValue struct {
+				Scheme string `json:"scheme"`
+			}
+			if err := json.Unmarshal([]byte(req.Header.Get(cfVisitor)), &cfVisitorValue); err == nil {
+				req.Header.Set(xForwardProto, cfVisitorValue.Scheme)
+			}
+		}
+
+		// Set headers with the real IP (already extracted from CF-Connecting-IP or custom header)
+		req.Header.Set(xForwardFor, realIP)
+		req.Header.Set(xRealIP, realIP)
+	} else {
+		// Not from trusted source, use direct IP
+		req.Header.Set(xRealIP, realIP)
+		// Remove CF headers if present
+		req.Header.Del(cfVisitor)
+		req.Header.Del(cfConnectingIP)
+	}
 }

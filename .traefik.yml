@@ -1,14 +1,13 @@
-displayName: Fossorial Badger reverse proxy
+displayName: Pangolin (Badger)
 type: middleware
+iconPath: .assets/icon.png
 
-import: github.com/onno204/badger-reverse-proxy
+import: github.com/onno204/badger
 
-summary: Middleware auth bouncer for Pangolin with secure proxy support
+summary: Middleware auth bouncer for Pangolin
 
 testData:
   apiBaseUrl: "http://localhost:3001/api/v1"
   userSessionCookieName: "p_session_token"
   resourceSessionRequestParam: "p_session_request"
-  clientIpHeader: "X-Forwarded-For"
-  # clientIPHeader: "X-Real-IP"
-  # clientIPHeader: "CF-Connecting-IP"
+  customIPHeader: "X-Forwarded-For"
