@@ -1,8 +1,12 @@
 # Pangolin Middleware: Badger
 
-Fork with real client IP support behind trusted proxies: `X-Forwarded-For`
-(and other forwarded headers) are used to determine the client IP. Since the
-Traefik entrypoint strips forwarded headers from untrusted peers
+Fork by [skyracer2012](https://github.com/skyracer2012/badger), based on
+[onno204/badger](https://github.com/onno204/badger) with the current upstream
+[fosrl/badger](https://github.com/fosrl/badger) `main` merged in.
+
+Real client IP support behind trusted proxies: `X-Forwarded-For` (and other
+forwarded headers) are used to determine the client IP. Since the Traefik
+entrypoint strips forwarded headers from untrusted peers
 (`forwardedHeaders.trustedIPs`), any forwarded header value reaching the plugin
 is trusted.
 
